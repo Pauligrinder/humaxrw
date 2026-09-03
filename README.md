@@ -1,15 +1,17 @@
 # HumaxRW 2026
 
-Read-only extractor for **Humax PVR-9200T / 9150T / 9300T** hard-disk dumps. It is a from-scratch replacement for the old 32-bit `humaxrw` 1.15 tool (xyz321), which does not run on Apple Silicon or current 64-bit Linux/Windows without compatibility layers.
+Read-only extractor for **Humax PVR-9200T / 9150T / 9300T** hard-disk dumps. Drop-in spirit of the old 32-bit `humaxrw` 1.15 (xyz321), rewritten so it runs on Apple Silicon and any other current machine with Python 3.9+.
 
-Requirements: **Python 3.9+**, standard library only.
+No packages to install. Clone and run:
 
 ```bash
+git clone https://github.com/Pauligrinder/humaxrw.git
+cd humaxrw
 python3 humaxrw.py -l /path/to/dump.img
 python3 humaxrw.py -g 1-20 -o ./recordings /path/to/dump.img
 ```
 
-The same commands work on macOS (Apple Silicon or Intel), Linux, and Windows.
+Works the same on macOS (Apple Silicon or Intel), Linux, and Windows. This tool **never writes** to the Humax image.
 
 ## What the original did
 
@@ -87,3 +89,7 @@ python3 -m unittest discover -s tests -v
 - 9200C directory records (0x130 bytes) are detected; writes to 9200C were never the goal.
 
 Original HumaxRW was © xyz321. This is an independent, read-only reimplementation of the published on-disk behaviour.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

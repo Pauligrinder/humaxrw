@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import unittest
 
-from humaxrw import decode_humax_name, human_size, parse_id_list, sanitize_filename, swap32, ts_align
+from struct import pack
+
+from humaxrw import (
+    decode_humax_name,
+    fat_next_cluster,
+    human_size,
+    parse_id_list,
+    sanitize_filename,
+    swap32,
+    ts_align,
+)
 
 
 class CodecTests(unittest.TestCase):
@@ -39,6 +49,28 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(off, 3)
         self.assertEqual(aligned[:1], b"\x47")
         self.assertEqual(len(aligned) % 188, 0)
+
+    def test_ts_align_leading_zeros(self):
+        pkt = b"\x47" + b"\x00" * 187
+        blob = b"\x00" * 78 + pkt * 4
+        off, aligned = ts_align(blob)
+        self.assertEqual(off, 78)
+        self.assertEqual(aligned[:1], b"\x47")
+
+    def test_fat_next_contiguous(self):
+        fat = bytearray(64 * 4)
+        fat[0:4] = pack("<I", 100)  # free-block count at FAT[0]
+        fat[11 * 4 : 12 * 4] = pack("<I", 11)  # cluster 10 -> 11
+        fat[12 * 4 : 13 * 4] = pack("<I", 12)
+        self.assertEqual(fat_next_cluster(bytes(fat), 10), 11)
+        self.assertEqual(fat_next_cluster(bytes(fat), 11), 12)
+
+    def test_fat_next_jump_and_eof(self):
+        fat = bytearray(64 * 4)
+        fat[11 * 4 : 12 * 4] = pack("<I", 40)
+        fat[41 * 4 : 42 * 4] = pack("<I", 0xFFFFFFFE)
+        self.assertEqual(fat_next_cluster(bytes(fat), 10), 40)
+        self.assertIsNone(fat_next_cluster(bytes(fat), 40))
 
 
 if __name__ == "__main__":

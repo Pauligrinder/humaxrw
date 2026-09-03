@@ -94,6 +94,24 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
     return (cleaned or "recording")[:max_len]
 
 
+def fat_next_cluster(fat: bytes, cluster: int) -> Optional[int]:
+    """Return the next cluster, or None at end-of-chain.
+
+    Humax FAT[0] holds the free-block count, so the entry for cluster C lives
+    at index C+1. For a contiguous file starting at C, FAT[C+1] == C+1.
+    """
+    n = len(fat) // 4
+    idx = cluster + 1
+    if idx < 0 or idx >= n:
+        return None
+    val = u32le(fat, idx * 4)
+    if val in FAT_EOF or val == 0:
+        return None
+    if 0 < val < n:
+        return val
+    return None
+
+
 def parse_id_list(spec: str) -> list[int]:
     seen: set[int] = set()
     out: list[int] = []
@@ -316,18 +334,7 @@ class HumaxDisk:
         return self._fat
 
     def _fat_next(self, cluster: int) -> Optional[int]:
-        fat = self._load_fat()
-        n = len(fat) // 4
-        if cluster < 0 or cluster >= n:
-            return None
-        val = u32le(fat, cluster * 4)
-        if val in FAT_EOF:
-            return cluster + 1 if cluster + 1 < n else None
-        if val == cluster or val == cluster + 1:
-            return cluster + 1 if cluster + 1 < n else None
-        if 0 <= val < n:
-            return val
-        return cluster + 1 if cluster + 1 < n else None
+        return fat_next_cluster(self._load_fat(), cluster)
 
     def iter_file_clusters(self, entry: DirEntry) -> Iterator[int]:
         part = self.partitions[0]
@@ -434,19 +441,19 @@ class HumaxDisk:
 
 
 def ts_align(data: bytes) -> tuple[int, bytes]:
-    limit = min(len(data), TS_PACKET)
-    best_off, best_hits = 0, -1
-    for off in range(limit):
-        hits = 0
-        for i in range(off, min(len(data), off + TS_PACKET * 8), TS_PACKET):
-            if data[i] == 0x47:
-                hits += 1
-        if hits > best_hits:
-            best_hits, best_off = hits, off
-    if best_hits >= 3:
-        aligned = data[best_off:]
-        n = (len(aligned) // TS_PACKET) * TS_PACKET
-        return best_off, aligned[:n] if n else aligned
+    """Skip leading padding and return (offset, packet-aligned payload)."""
+    if len(data) < TS_PACKET * 3:
+        return 0, data
+    search = min(len(data) - TS_PACKET * 2, 1024)
+    for off in range(search):
+        if (
+            data[off] == 0x47
+            and data[off + TS_PACKET] == 0x47
+            and data[off + TS_PACKET * 2] == 0x47
+        ):
+            aligned = data[off:]
+            n = (len(aligned) // TS_PACKET) * TS_PACKET
+            return off, aligned[:n] if n else aligned
     return 0, data
 
 

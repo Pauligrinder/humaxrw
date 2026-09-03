@@ -52,4 +52,4 @@ You can also pass a raw device (`/dev/rdiskN` on macOS, `/dev/sdX` on Linux) if 
 
 ## Layout notes
 
-The 9200-series disk has three partitions: a large AV volume, a 256 MiB EPG/metadata volume, and a small “user” volume. Recordings live as `N.av` + `N.elu` on the first, with `N.epg` (title/synopsis) on the second. Names and MPEG-TS payloads are stored as 32-bit MIPS words; this tool unpacks them into host byte order so the `.ts` files play in VLC.
+The 9200-series disk has three partitions: a large AV volume, a 256 MiB EPG/metadata volume, and a small “user” volume. Recordings live as `N.av` + `N.elu` on the first, with `N.epg` (title/synopsis) on the second. Names and MPEG-TS payloads are stored as 32-bit MIPS words; this tool unpacks them into host byte order so the `.ts` files play in VLC. Recordings are often fragmented; the extractor follows the on-disk FAT (the first FAT word is a free-block count, so cluster *C* is at index *C+1*).

@@ -1,95 +1,55 @@
 # HumaxRW 2026
 
-Read-only extractor for **Humax PVR-9200T / 9150T / 9300T** hard-disk dumps. Drop-in spirit of the old 32-bit `humaxrw` 1.15 (xyz321), rewritten so it runs on Apple Silicon and any other current machine with Python 3.9+.
+Read recordings off a **Humax PVR-9200T / 9150T / 9300T** hard disk (or a `dd`/`ddrescue` image of one) on any current machine.
 
-No packages to install. Clone and run:
+The original HumaxRW was a 32-bit Windows/Linux command-line tool (last public build **1.15**, xyz321). It cannot run natively on Apple Silicon. This is a from-scratch, **read-only** Python 3 replacement: no 32-bit libraries, no Wine, no extra packages.
 
-```bash
-git clone https://github.com/Pauligrinder/humaxrw.git
-cd humaxrw
-python3 humaxrw.py -l /path/to/dump.img
-python3 humaxrw.py -g 1-20 -o ./recordings /path/to/dump.img
-```
+Those boxes use a proprietary filesystem, not FAT or ext. Plug the drive in (or point this at an image) and extract MPEG-TS files you can play in VLC.
 
-Works the same on macOS (Apple Silicon or Intel), Linux, and Windows. This tool **never writes** to the Humax image.
+## Requirements
 
-## What the original did
+- Python 3.9 or later (the one that ships with macOS 15/16 is fine)
+- A disk image, or the Humax drive attached as a raw device
 
-Those set-top boxes do **not** use FAT32 or ext3 for recordings. The drive has a custom partition table (signature `AA 55` at offset `0x1FC`), a proprietary directory/FAT, and MPEG-TS stored with every 32-bit word byte-swapped. `humaxrw` talked to the raw disk (Windows `2:`, Linux `/dev/sdb`) and could:
-
-- list recordings
-- copy them off as `.ts` plus `.hre` / `.elu` / `.epg` sidecars
-- copy them back, delete, and repair a corrupt record list
-
-This 2026 port covers the part people still need: **open a dump or a raw disk and get playable `.ts` files out**. It never writes to the Humax image.
-
-## Typical workflow
-
-1. Image the drive with `dd` or `ddrescue` (safer than working on the failing disk).
-2. List what is on it:
-
-   ```bash
-   python3 humaxrw.py -l dump.img
-   ```
-
-3. Extract a range, or everything:
-
-   ```bash
-   python3 humaxrw.py -g 2-50,80 -o ./out dump.img
-   python3 humaxrw.py -b -o ./out dump.img
-   ```
-
-4. Play the `.ts` files in VLC or ffmpeg.
-
-If the record list is corrupt, recovery mode still uses the on-disk directory:
+## Usage
 
 ```bash
-python3 humaxrw.py -r -l dump.img
-python3 humaxrw.py -r -g 2-100 -o ./out dump.img
+python3 humaxrw.py -l /path/to/humax-9200t.img
+python3 humaxrw.py -g 49 -o ./out /path/to/humax-9200t.img
+python3 humaxrw.py -g 2-10,49 -o ./out /path/to/humax-9200t.img
+python3 humaxrw.py -b -o ./out /path/to/humax-9200t.img
 ```
 
-If even the directory is gone, carve MPEG-TS off the image (slow on large dumps):
+Recording numbers are the Humax file numbers (`36.av` → `36`). Subcommands also work: `list`, `info`, `get`, `backup`.
+
+Each extract writes:
+
+| File | Contents |
+|------|----------|
+| `NNN Title.ts` | MPEG-TS video (playable in VLC / IINA / mpv) |
+| `.elu` | Original timing sidecar |
+| `.epg` | Original programme info |
+| `.txt` / `.json` | Title and synopsis in plain text |
+
+The tool never writes to the Humax image or disk.
+
+## Disk images
+
+A full-disk `ddrescue` image is the usual input:
 
 ```bash
-python3 humaxrw.py --carve -o ./out dump.img
+sudo ddrescue -n /dev/rdiskN humax-9200t.img humax-9200t.log
+python3 humaxrw.py list humax-9200t.img
 ```
 
-On macOS a live disk looks like `/dev/diskN` (use Disk Utility / `diskutil list`, then `sudo`). Prefer a dump.
+You can also pass a raw device (`/dev/rdiskN` on macOS, `/dev/sdX` on Linux) if you would rather not image first. macOS may require `sudo` for raw disks.
 
-## Command line
+## What this is *not*
 
-| Flag | Meaning |
-| --- | --- |
-| `-l` | List recordings |
-| `-g LIST` | Get recordings (`10-20,30,41-42` or `all`) |
-| `-i LIST` | Extra info for those numbers |
-| `-b` | Backup / extract all programme files |
-| `-r` | Recovery mode (ignore titles if metadata is junk) |
-| `-n` | Do not parse EPG / titles |
-| `-o DIR` | Output directory |
-| `--sidecar` | Also write `.elu` / `.epg` / `.hre` |
-| `--carve` | Scan the image for MPEG-TS |
-| `--json` | Machine-readable listing |
-| `--overwrite` | Replace existing output files |
-| `-v` | Version |
+- It does not talk to later Humax models (HDR-FOX T2, etc.). Those use a normal Linux filesystem.
+- It does not write recordings back onto a Humax disk (the old `-p` / delete options).
+- Encrypted HD recordings from later boxes are a different problem.
 
-`LIST` syntax matches the original tool.
+## Layout notes
 
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-## Limits
-
-- Read-only: no delete, put, unprotect, or partition repair (`humaxcheck -p`).
-- Titles come from `_RECORD_LIST_` / `.epg` when those files are intact; otherwise you get `2.av`-style names.
-- Fragmented files that are not contiguous on disk may extract truncated (the contiguous start+size path is what almost all dumps need). Use `--carve` if a file looks wrong.
-- 9200C directory records (0x130 bytes) are detected; writes to 9200C were never the goal.
-
-Original HumaxRW was © xyz321. This is an independent, read-only reimplementation of the published on-disk behaviour.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+The 9200-series disk has three partitions: a large AV volume, a 256 MiB EPG/metadata volume, and a small “user” volume. Recordings live as `N.av` + `N.elu` on the first, with `N.epg` (title/synopsis) on the second. Names and MPEG-TS payloads are stored as 32-bit MIPS words; this tool unpacks them into host byte order so the `.ts` files play in VLC. Recordings are often fragmented; the extractor follows the on-disk FAT (the first FAT word is a free-block count, so cluster *C* is at index *C+1*).

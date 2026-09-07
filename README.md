@@ -42,7 +42,22 @@ sudo ddrescue -n /dev/rdiskN humax-9200t.img humax-9200t.log
 python3 humaxrw.py list humax-9200t.img
 ```
 
-You can also pass a raw device (`/dev/rdiskN` on macOS, `/dev/sdX` on Linux) if you would rather not image first. macOS may require `sudo` for raw disks.
+You can also pass a raw device if you would rather not image first:
+
+| OS | Device path | Notes |
+|----|-------------|--------|
+| macOS | `/dev/rdiskN` | Often needs `sudo` |
+| Linux | `/dev/sdX` or `/dev/nvmeXn1` | Often needs root |
+| Windows | `\\.\PhysicalDriveN` | Run the shell **as Administrator** |
+
+On Windows, find `N` in Disk Management (`diskmgmt.msc`) or PowerShell (`Get-Disk`). Example:
+
+```powershell
+python humaxrw.py -l \\.\PhysicalDrive1
+python humaxrw.py -g 49 -o .\out \\.\PhysicalDrive1
+```
+
+If Windows offers to initialize or format the disk, decline — the Humax layout is proprietary and must not be overwritten. An image file (`.img`) works the same way and does not need admin rights.
 
 ## What this is *not*
 

@@ -161,28 +161,37 @@ jobs:
         run: |
           set -euo pipefail
           NAME="HumaxRW-${HUMAXRW_VERSION}-${ARTIFACT_OS}-${ARTIFACT_ARCH}"
+          rm -rf staging
           mkdir -p staging
           case "${{ runner.os }}" in
             macOS)
               ditto dist/HumaxRW.app "staging/HumaxRW.app"
-              (cd staging && zip -ry "../${NAME}.zip" HumaxRW.app)
               ;;
             Windows)
-              # Git Bash on windows-latest / windows-11-arm
               cp dist/HumaxRW.exe staging/
-              (cd staging && zip -r "../${NAME}.zip" HumaxRW.exe)
               ;;
             Linux)
               cp dist/HumaxRW staging/
               cp humaxrw_gui.sh staging/
               chmod +x staging/HumaxRW staging/humaxrw_gui.sh
-              (cd staging && zip -r "../${NAME}.zip" HumaxRW humaxrw_gui.sh)
               ;;
             *)
               echo "Unknown runner OS: ${{ runner.os }}" >&2
               exit 1
               ;;
           esac
+          # zip is missing on some Windows runners — use Python everywhere.
+          python - <<'PY'
+          import os, zipfile
+          from pathlib import Path
+          name = f"HumaxRW-{os.environ['HUMAXRW_VERSION']}-{os.environ['ARTIFACT_OS']}-{os.environ['ARTIFACT_ARCH']}.zip"
+          root = Path("staging")
+          with zipfile.ZipFile(name, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      zf.write(path, path.relative_to(root).as_posix())
+          print(name, Path(name).stat().st_size)
+          PY
           ls -lh "${NAME}.zip"
           echo "PACKAGE_NAME=${NAME}.zip" >> "$GITHUB_ENV"
 
@@ -195,7 +204,12 @@ jobs:
 
   release:
     needs: [resolve-version, build]
-    if: needs.resolve-version.outputs.make_release == 'true'
+    # Publish whatever arches succeeded (fail-fast is off on the matrix).
+    if: >-
+      always()
+      && needs.resolve-version.outputs.make_release == 'true'
+      && needs.resolve-version.result == 'success'
+      && needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -213,6 +227,12 @@ jobs:
 
       - name: List assets
         run: find release-assets -type f -print | sort
+
+      - name: Require at least one package
+        run: |
+          count=$(find release-assets -type f -name '*.zip' | wc -l)
+          echo "zip count=${count}"
+          test "${count}" -ge 1
 
       - name: Create or update GitHub Release
         env:

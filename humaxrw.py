@@ -16,14 +16,18 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from struct import unpack_from
 from typing import BinaryIO, Iterable, Iterator, Optional
 
-VERSION = "2026.1"
+VERSION = "2026.2"
 SECTOR = 512
 DIR_ENTRY_SIZE = 128
 TS_PACKET = 188
+HRE_SIZE_9200 = 304
+HRE_SIZE_9200C = 316
+DEFAULT_MAX_BYTES = 20 * 1024**3  # skip pathological orphans (e.g. 295 GiB ghosts)
 
 FLAG_ELU = 0x1000
 FLAG_AV = 0x1002
@@ -38,6 +42,14 @@ def u16le(buf: bytes, off: int) -> int:
 
 def u32le(buf: bytes, off: int) -> int:
     return unpack_from("<I", buf, off)[0]
+
+
+def u32be_bytes(buf: bytes, off: int) -> int:
+    return (buf[off] << 24) | (buf[off + 1] << 16) | (buf[off + 2] << 8) | buf[off + 3]
+
+
+def u16be_bytes(buf: bytes, off: int) -> int:
+    return (buf[off] << 8) | buf[off + 1]
 
 
 def swap32(data: bytes) -> bytes:
@@ -80,6 +92,11 @@ def latin_strings(data: bytes, min_len: int = 4) -> list[str]:
     return out
 
 
+def cstring(data: bytes, off: int, maxlen: int) -> str:
+    chunk = data[off : off + maxlen]
+    return chunk.split(b"\x00", 1)[0].decode("latin-1", "replace").strip()
+
+
 def human_size(n: int) -> str:
     for unit, div in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
         if n >= div:
@@ -92,6 +109,42 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
     cleaned = "".join("_" if c in bad else c for c in name).strip(" .")
     cleaned = " ".join(cleaned.split())
     return (cleaned or "recording")[:max_len]
+
+
+def parse_size_limit(spec: Optional[str]) -> Optional[int]:
+    """Return max bytes, or None for unlimited. Empty/0 means unlimited."""
+    if spec is None:
+        return DEFAULT_MAX_BYTES
+    text = spec.strip().lower()
+    if text in ("", "0", "none", "unlimited", "off"):
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgtpe]i?b?)?", text)
+    if not m:
+        raise ValueError(f"invalid size limit: {spec!r}")
+    value = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+    mult = {
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "ki": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mi": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gi": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "ti": 1024**4,
+        "tib": 1024**4,
+    }.get(unit)
+    if mult is None:
+        raise ValueError(f"invalid size unit in {spec!r}")
+    return int(value * mult)
 
 
 def fat_next_cluster(fat: bytes, cluster: int) -> Optional[int]:
@@ -182,17 +235,50 @@ class DirEntry:
 
 
 @dataclass
+class RecordListEntry:
+    """One _RECORD_LIST_ / .hre slot (304 bytes on 9200T, 316 on 9200C)."""
+
+    number: int
+    start_unix: int
+    end_unix: int
+    title: str
+    channel: str
+    raw: bytes = field(repr=False, default=b"")
+
+    @property
+    def start_dt(self) -> Optional[datetime]:
+        if self.start_unix <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(self.start_unix, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+
+@dataclass
 class Recording:
     number: int
     av: DirEntry
     elu: Optional[DirEntry] = None
     epg: Optional[DirEntry] = None
+    hre: Optional[RecordListEntry] = None
     title: str = ""
     synopsis: str = ""
+    channel: str = ""
+    start_unix: int = 0
 
     @property
     def size(self) -> int:
         return self.av.size
+
+    @property
+    def start_dt(self) -> Optional[datetime]:
+        if self.start_unix <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(self.start_unix, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
 
 
 def _looks_like_superblock(sb: bytes) -> bool:
@@ -205,6 +291,49 @@ def _looks_like_superblock(sb: bytes) -> bool:
     return 1 <= spc <= 4096 and dir_lba != 0
 
 
+def parse_hre_entries(data: bytes) -> list[RecordListEntry]:
+    """Parse concatenated .hre / _RECORD_LIST_ bytes (after dword-swap)."""
+    if len(data) >= HRE_SIZE_9200 and len(data) % HRE_SIZE_9200 == 0:
+        entry_size = HRE_SIZE_9200
+    elif len(data) >= HRE_SIZE_9200C and len(data) % HRE_SIZE_9200C == 0:
+        entry_size = HRE_SIZE_9200C
+    elif len(data) >= HRE_SIZE_9200:
+        entry_size = HRE_SIZE_9200
+    else:
+        return []
+
+    out: list[RecordListEntry] = []
+    for off in range(0, len(data) - entry_size + 1, entry_size):
+        ent = data[off : off + entry_size]
+        if ent == b"\x00" * entry_size:
+            continue
+        number = u16be_bytes(ent, 0x05)
+        if number == 0:
+            continue
+        start_unix = u32be_bytes(ent, 0x11)
+        end_unix = u32be_bytes(ent, 0x15)
+        # Reject clearly empty / corrupted slots (original also checks related words).
+        a = u32le(ent, 0x04) & 0x00FFFF00
+        b = u32le(ent, 0x08) & 0x00FFFF00
+        if a == 0 and b == 0 and start_unix == 0:
+            continue
+        title = cstring(ent, 0x1C, 0x31)
+        channel = cstring(ent, 0x4D, 0x28)
+        if not title and not channel and start_unix == 0:
+            continue
+        out.append(
+            RecordListEntry(
+                number=number,
+                start_unix=start_unix,
+                end_unix=end_unix,
+                title=title or channel,
+                channel=channel,
+                raw=ent,
+            )
+        )
+    return out
+
+
 class HumaxDisk:
     def __init__(self, source: str | os.PathLike[str]):
         self.path = Path(source)
@@ -215,6 +344,7 @@ class HumaxDisk:
         self._av_dir: list[DirEntry] = []
         self._meta_dir: list[DirEntry] = []
         self._recordings: Optional[list[Recording]] = None
+        self._record_list: Optional[dict[int, RecordListEntry]] = None
 
     def __enter__(self) -> "HumaxDisk":
         self.open()
@@ -314,13 +444,15 @@ class HumaxDisk:
             name = decode_humax_name(ent[0x40:0x80])
             if not name:
                 continue
+            # Directory size is a 64-bit value: high dword at 0x20, low at 0x24.
+            size = u32le(ent, 0x24) + (u32le(ent, 0x20) << 32)
             entries.append(
                 DirEntry(
                     name=name,
                     start_lba=u32le(ent, 0x0C),
                     last_lba=u32le(ent, 0x14),
                     sectors=u32le(ent, 0x1C),
-                    size=u32le(ent, 0x24),
+                    size=size,
                     flags=u32le(ent, 0x28),
                     extra=u32le(ent, 0x2C),
                 )
@@ -382,6 +514,27 @@ class HumaxDisk:
             yield swap32(data)
             remaining -= len(data)
 
+    def read_meta_file(self, entry: DirEntry) -> bytes:
+        """Read a (usually small) metadata-partition file and dword-swap it."""
+        raw = self.read_at(entry.start_lba, min(entry.size, entry.sectors * SECTOR or entry.size))
+        if len(raw) > entry.size:
+            raw = raw[: entry.size]
+        return swap32(raw)
+
+    def record_list(self) -> dict[int, RecordListEntry]:
+        if self._record_list is not None:
+            return self._record_list
+        by_num: dict[int, RecordListEntry] = {}
+        for entry in self._meta_dir:
+            if entry.name.upper() != "_RECORD_LIST_":
+                continue
+            data = self.read_meta_file(entry)
+            for rec in parse_hre_entries(data):
+                by_num[rec.number] = rec
+            break
+        self._record_list = by_num
+        return by_num
+
     def recordings(self) -> list[Recording]:
         if self._recordings is not None:
             return self._recordings
@@ -392,20 +545,32 @@ class HumaxDisk:
         }
         elus = {e.number: e for e in self._av_dir if e.suffix == "elu" and e.number is not None}
         epgs = {e.number: e for e in self._meta_dir if e.suffix == "epg" and e.number is not None}
+        hres = self.record_list()
         recs: list[Recording] = []
         for num in sorted(avs):
             epg_ent = epgs.get(num)
+            hre = hres.get(num)
             title, synopsis = ("", "")
             if epg_ent is not None:
                 title, synopsis = self._parse_epg(epg_ent)
+            channel = ""
+            start_unix = 0
+            if hre is not None:
+                # Record list is authoritative for display name and air time.
+                title = hre.title or title
+                channel = hre.channel
+                start_unix = hre.start_unix
             recs.append(
                 Recording(
                     number=num,
                     av=avs[num],
                     elu=elus.get(num),
                     epg=epg_ent,
+                    hre=hre,
                     title=title,
                     synopsis=synopsis,
+                    channel=channel,
+                    start_unix=start_unix,
                 )
             )
         self._recordings = recs
@@ -413,6 +578,10 @@ class HumaxDisk:
 
     def _parse_epg(self, entry: DirEntry) -> tuple[str, str]:
         raw = self.read_at(entry.start_lba, min(entry.size, 8192))
+        # Firmware variants prepend a ~332-byte header; byte 13 is a reliable marker
+        # that the first latin string is a channel/series alias rather than the title.
+        if len(raw) > 332 and raw[13] == 0:
+            raw = raw[332:]
         strings = latin_strings(swap32(raw), min_len=4)
         title = strings[0].strip() if strings else ""
         synopsis = ""
@@ -441,7 +610,11 @@ class HumaxDisk:
 
 
 def ts_align(data: bytes) -> tuple[int, bytes]:
-    """Skip leading padding and return (offset, packet-aligned payload)."""
+    """Skip leading padding and return (offset, sync-aligned payload).
+
+    Leaves a trailing partial packet in place so the extractor's leftover buffer
+    can combine it with the next chunk instead of dropping those bytes.
+    """
     if len(data) < TS_PACKET * 3:
         return 0, data
     search = min(len(data) - TS_PACKET * 2, 1024)
@@ -451,10 +624,23 @@ def ts_align(data: bytes) -> tuple[int, bytes]:
             and data[off + TS_PACKET] == 0x47
             and data[off + TS_PACKET * 2] == 0x47
         ):
-            aligned = data[off:]
-            n = (len(aligned) // TS_PACKET) * TS_PACKET
-            return off, aligned[:n] if n else aligned
+            return off, data[off:]
     return 0, data
+
+
+def recording_label(rec: Recording) -> str:
+    """Build an output stem matching classic HumaxRW: YYYYMMDD HHMM Title."""
+    dt = rec.start_dt
+    title = rec.title.strip() if rec.title else ""
+    if dt is not None and title:
+        stamp = dt.strftime("%Y%m%d %H%M")
+        return sanitize_filename(f"{stamp} {title}")
+    if dt is not None:
+        stamp = dt.strftime("%Y%m%d %H%M")
+        return sanitize_filename(f"{stamp} {rec.number:03d}")
+    if title:
+        return sanitize_filename(f"{rec.number:03d} {title}")
+    return sanitize_filename(f"{rec.number:03d}")
 
 
 def extract_recording(
@@ -466,7 +652,7 @@ def extract_recording(
     progress: bool = True,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    label = sanitize_filename(f"{rec.number:03d} {rec.title}" if rec.title else f"{rec.number:03d}")
+    label = recording_label(rec)
     ts_path = out_dir / f"{label}.ts"
     first = True
     written = 0
@@ -484,12 +670,12 @@ def extract_recording(
             written += n
             if progress:
                 pct = min(100.0, 100.0 * written / max(rec.size, 1))
-                print(
-                    f"\r  {ts_path.name}: {human_size(written)} / {human_size(rec.size)} ({pct:5.1f}%)",
-                    end="",
-                    file=sys.stderr,
-                    flush=True,
+                msg = (
+                    f"\r  {ts_path.name}: {human_size(written)} / "
+                    f"{human_size(rec.size)} ({pct:5.1f}%)"
                 )
+                # Clear to end of line so shorter updates do not leave junk.
+                print(f"{msg}\x1b[K", end="", file=sys.stderr, flush=True)
         if leftover:
             out.write(leftover)
             written += len(leftover)
@@ -497,13 +683,21 @@ def extract_recording(
         print(file=sys.stderr)
     if sidecars:
         if rec.elu is not None:
-            (out_dir / f"{label}.elu").write_bytes(disk.read_at(rec.elu.start_lba, rec.elu.size))
+            elu_path = out_dir / f"{label}.elu"
+            with elu_path.open("wb") as out:
+                for chunk in disk.iter_file_bytes(rec.elu):
+                    out.write(chunk)
         if rec.epg is not None:
-            (out_dir / f"{label}.epg").write_bytes(disk.read_at(rec.epg.start_lba, rec.epg.size))
+            (out_dir / f"{label}.epg").write_bytes(disk.read_meta_file(rec.epg))
+        if rec.hre is not None and rec.hre.raw:
+            (out_dir / f"{label}.hre").write_bytes(rec.hre.raw)
         meta = {
             "number": rec.number,
             "title": rec.title,
+            "channel": rec.channel,
             "synopsis": rec.synopsis,
+            "start_unix": rec.start_unix or None,
+            "start": rec.start_dt.isoformat() if rec.start_dt else None,
             "bytes": rec.size,
             "written": written,
             "ts_sync_skip": align_skip,
@@ -512,10 +706,15 @@ def extract_recording(
         (out_dir / f"{label}.json").write_text(
             json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
-        if rec.title or rec.synopsis:
-            (out_dir / f"{label}.txt").write_text(
-                f"{rec.title}\n\n{rec.synopsis}\n", encoding="utf-8"
-            )
+        if rec.title or rec.synopsis or rec.channel:
+            lines = [rec.title or ""]
+            if rec.channel:
+                lines.append(f"Channel: {rec.channel}")
+            if rec.start_dt:
+                lines.append(f"Start: {rec.start_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+            lines.append("")
+            lines.append(rec.synopsis or "")
+            (out_dir / f"{label}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ts_path
 
 
@@ -527,9 +726,12 @@ def cmd_list(disk: HumaxDisk, as_json: bool = False) -> None:
                 "index": i + 1,
                 "number": r.number,
                 "title": r.title,
+                "channel": r.channel,
+                "start": r.start_dt.isoformat() if r.start_dt else None,
                 "bytes": r.size,
                 "sectors": r.av.sectors,
                 "synopsis": r.synopsis,
+                "in_record_list": r.hre is not None,
             }
             for i, r in enumerate(recs)
         ]
@@ -541,13 +743,16 @@ def cmd_list(disk: HumaxDisk, as_json: bool = False) -> None:
     if not recs:
         print("No recordings found.")
         return
-    print(f"{'#':>4} {'No':>4} {'Size':>10}  Title")
-    print("-" * 72)
+    print(f"{'#':>4} {'No':>4} {'Size':>10} {'Start':>16}  Title")
+    print("-" * 80)
     for i, r in enumerate(recs, 1):
         title = r.title or r.av.name
-        print(f"{i:4d} {r.number:4d} {human_size(r.size):>10}  {title}")
+        if r.channel and r.channel != title:
+            title = f"{title} [{r.channel}]"
+        start = r.start_dt.strftime("%Y-%m-%d %H:%M") if r.start_dt else ""
+        print(f"{i:4d} {r.number:4d} {human_size(r.size):>10} {start:>16}  {title}")
     total = sum(r.size for r in recs)
-    print("-" * 72)
+    print("-" * 80)
     print(f"{len(recs)} recordings, {human_size(total)} of MPEG-TS")
 
 
@@ -564,6 +769,12 @@ def cmd_info(disk: HumaxDisk, spec: Optional[str]) -> None:
     for r in recs:
         print(f"Recording {r.number}: {r.title or r.av.name}")
         print(f"  MPEG-TS    {human_size(r.size)}  start LBA {r.av.start_lba:#x}")
+        if r.channel:
+            print(f"  channel    {r.channel}")
+        if r.start_dt:
+            print(f"  start      {r.start_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+        if r.hre is None:
+            print("  record     (not in _RECORD_LIST_)")
         if r.elu:
             print(f"  timing     {human_size(r.elu.size)}")
         if r.epg:
@@ -574,11 +785,24 @@ def cmd_info(disk: HumaxDisk, spec: Optional[str]) -> None:
         print()
 
 
-def cmd_get(disk: HumaxDisk, spec: str, out_dir: Path, sidecars: bool) -> None:
+def cmd_get(
+    disk: HumaxDisk,
+    spec: str,
+    out_dir: Path,
+    sidecars: bool,
+    max_bytes: Optional[int],
+) -> None:
     recs = disk.find_recordings(spec)
     if not recs:
         raise SystemExit(f"No recordings matched {spec!r}")
     for rec in recs:
+        if max_bytes is not None and rec.size > max_bytes:
+            print(
+                f"Skipping {rec.number} — {rec.title or rec.av.name} "
+                f"({human_size(rec.size)} > limit {human_size(max_bytes)})",
+                file=sys.stderr,
+            )
+            continue
         print(f"Extracting {rec.number} — {rec.title or rec.av.name}", file=sys.stderr)
         path = extract_recording(disk, rec, out_dir, sidecars=sidecars)
         print(path)
@@ -594,6 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
   python3 humaxrw.py -g 49 -o ./out dump.img
   python3 humaxrw.py list dump.img
   python3 humaxrw.py get dump.img 1-5,49 -o ./out
+  python3 humaxrw.py -b -o ./out --max-size 50G dump.img
 """,
     )
     p.add_argument("-V", "--version", action="version", version=f"HumaxRW {VERSION}")
@@ -604,6 +829,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default=".", help="output directory")
     p.add_argument("--json", action="store_true", help="JSON listing")
     p.add_argument("--no-sidecars", action="store_true", help="write only the .ts file")
+    p.add_argument(
+        "--max-size",
+        default=None,
+        metavar="SIZE",
+        help=(
+            "skip recordings larger than SIZE when extracting "
+            f"(default {human_size(DEFAULT_MAX_BYTES)}; 0/unlimited disables)"
+        ),
+    )
     p.add_argument(
         "words",
         nargs="*",
@@ -645,6 +879,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         parser.print_help()
         return 2
 
+    try:
+        max_bytes = parse_size_limit(args.max_size)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     with HumaxDisk(image) as disk:
         if cmd == "list":
             cmd_list(disk, as_json=args.json)
@@ -653,9 +892,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         elif cmd == "get":
             if not ids:
                 raise SystemExit("get requires a recording list, e.g. -g 49 or get IMAGE 49")
-            cmd_get(disk, ids, Path(args.output), sidecars=not args.no_sidecars)
+            cmd_get(disk, ids, Path(args.output), sidecars=not args.no_sidecars, max_bytes=max_bytes)
         elif cmd == "backup":
-            cmd_get(disk, "all", Path(args.output), sidecars=not args.no_sidecars)
+            cmd_get(disk, "all", Path(args.output), sidecars=not args.no_sidecars, max_bytes=max_bytes)
         else:
             parser.print_help()
             return 2

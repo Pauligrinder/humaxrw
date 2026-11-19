@@ -5,10 +5,13 @@ import unittest
 from struct import pack
 
 from humaxrw import (
+    HRE_SIZE_9200,
     decode_humax_name,
     fat_next_cluster,
     human_size,
+    parse_hre_entries,
     parse_id_list,
+    parse_size_limit,
     sanitize_filename,
     swap32,
     ts_align,
@@ -50,12 +53,41 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(aligned[:1], b"\x47")
         self.assertEqual(len(aligned) % 188, 0)
 
+    def test_ts_align_keeps_trailing_partial(self):
+        pkt = b"\x47" + b"\x00" * 187
+        partial = b"\x47" + b"\x11" * 50
+        blob = b"\x00" * 5 + pkt * 3 + partial
+        off, aligned = ts_align(blob)
+        self.assertEqual(off, 5)
+        self.assertTrue(aligned.endswith(partial))
+
     def test_ts_align_leading_zeros(self):
         pkt = b"\x47" + b"\x00" * 187
         blob = b"\x00" * 78 + pkt * 4
         off, aligned = ts_align(blob)
         self.assertEqual(off, 78)
         self.assertEqual(aligned[:1], b"\x47")
+
+    def test_parse_size_limit(self):
+        self.assertEqual(parse_size_limit(None), 20 * 1024**3)
+        self.assertIsNone(parse_size_limit("0"))
+        self.assertEqual(parse_size_limit("50G"), 50 * 1024**3)
+
+    def test_parse_hre_entries(self):
+        ent = bytearray(HRE_SIZE_9200)
+        ent[0x05] = 0x00
+        ent[0x06] = 0x31  # number 49
+        # start 2010-06-15 18:30 UTC = 1276626600 = 0x4C17B4A8
+        ent[0x11:0x15] = bytes.fromhex("4c17b4a8")
+        ent[0x15:0x19] = bytes.fromhex("4c17c000")
+        ent[0x1C : 0x1C + 11] = b"Vain elamaa"
+        ent[0x4D : 0x4D + 4] = b"YLE1"
+        parsed = parse_hre_entries(bytes(ent))
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].number, 49)
+        self.assertEqual(parsed[0].title, "Vain elamaa")
+        self.assertEqual(parsed[0].channel, "YLE1")
+        self.assertEqual(parsed[0].start_unix, 0x4C17B4A8)
 
     def test_fat_next_contiguous(self):
         fat = bytearray(64 * 4)

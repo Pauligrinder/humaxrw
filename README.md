@@ -18,18 +18,22 @@ python3 humaxrw.py -l /path/to/humax-9200t.img
 python3 humaxrw.py -g 49 -o ./out /path/to/humax-9200t.img
 python3 humaxrw.py -g 2-10,49 -o ./out /path/to/humax-9200t.img
 python3 humaxrw.py -b -o ./out /path/to/humax-9200t.img
+python3 humaxrw.py -b -o ./out --max-size 50G /path/to/humax-9200t.img
 ```
 
 Recording numbers are the Humax file numbers (`36.av` → `36`). Subcommands also work: `list`, `info`, `get`, `backup`.
+
+Titles and air times come from `_RECORD_LIST_` on the metadata partition (same data as classic `.hre` sidecars), so series sort in chronological order. EPG text is still used for synopses and as a fallback name. Extracts larger than **20 GiB** are skipped by default (`--max-size 0` disables the limit) so orphaned giant `.av` files do not block a backup.
 
 Each extract writes:
 
 | File | Contents |
 |------|----------|
-| `NNN Title.ts` | MPEG-TS video (playable in VLC / IINA / mpv) |
-| `.elu` | Original timing sidecar |
-| `.epg` | Original programme info |
-| `.txt` / `.json` | Title and synopsis in plain text |
+| `YYYYMMDD HHMM Title.ts` | MPEG-TS video (playable in VLC / IINA / mpv) |
+| `.elu` | Original timing sidecar (FAT-aware, byte-swapped) |
+| `.epg` | Original programme info (byte-swapped) |
+| `.hre` | Record-list entry when available |
+| `.txt` / `.json` | Title, channel, start time, synopsis |
 
 The tool never writes to the Humax image or disk.
 
@@ -67,4 +71,4 @@ If Windows offers to initialize or format the disk, decline — the Humax layout
 
 ## Layout notes
 
-The 9200-series disk has three partitions: a large AV volume, a 256 MiB EPG/metadata volume, and a small “user” volume. Recordings live as `N.av` + `N.elu` on the first, with `N.epg` (title/synopsis) on the second. Names and MPEG-TS payloads are stored as 32-bit MIPS words; this tool unpacks them into host byte order so the `.ts` files play in VLC. Recordings are often fragmented; the extractor follows the on-disk FAT (the first FAT word is a free-block count, so cluster *C* is at index *C+1*).
+The 9200-series disk has three partitions: a large AV volume, a 256 MiB EPG/metadata volume, and a small “user” volume. Recordings live as `N.av` + `N.elu` on the first, with `N.epg` (synopsis) and `_RECORD_LIST_` (titles / start times / PIDs) on the second. Names and MPEG-TS payloads are stored as 32-bit MIPS words; this tool unpacks them into host byte order so the `.ts` files play in VLC. Directory sizes are 64-bit. Recordings are often fragmented; the extractor follows the on-disk FAT (the first FAT word is a free-block count, so cluster *C* is at index *C+1*).

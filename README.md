@@ -19,17 +19,18 @@ python3 humaxrw.py -g 49 -o ./out /path/to/humax-9200t.img
 python3 humaxrw.py -g 2-10,49 -o ./out /path/to/humax-9200t.img
 python3 humaxrw.py -b -o ./out /path/to/humax-9200t.img
 python3 humaxrw.py -b -o ./out --max-size 50G /path/to/humax-9200t.img
+python3 humaxrw.py -g 42 -o ./out --chunk-size 4G --max-size 0 /path/to/humax-9200t.img
 ```
 
 Recording numbers are the Humax file numbers (`36.av` → `36`). Subcommands also work: `list`, `info`, `get`, `backup`.
 
-Titles and air times come from `_RECORD_LIST_` on the metadata partition (same data as classic `.hre` sidecars), so series sort in chronological order. EPG text is still used for synopses and as a fallback name. Extracts larger than **20 GiB** are skipped by default (`--max-size 0` disables the limit) so orphaned giant `.av` files do not block a backup.
+Titles and air times come from `_RECORD_LIST_` on the metadata partition (same data as classic `.hre` sidecars), so series sort in chronological order. EPG text is still used for synopses and as a fallback name. Extracts larger than **20 GiB** are skipped by default (`--max-size 0` disables the limit) so orphaned giant `.av` files do not block a backup. Use `--chunk-size` to split a recording into packet-aligned `.partNNN.ts` pieces (handy for huge files you still want to keep).
 
 Each extract writes:
 
 | File | Contents |
 |------|----------|
-| `YYYYMMDD HHMM Title.ts` | MPEG-TS video (playable in VLC / IINA / mpv) |
+| `YYYYMMDD HHMM Title.ts` | MPEG-TS video (or `.part001.ts`, `.part002.ts`, … with `--chunk-size`) |
 | `.elu` | Original timing sidecar (FAT-aware, byte-swapped) |
 | `.epg` | Original programme info (byte-swapped) |
 | `.hre` | Record-list entry when available |

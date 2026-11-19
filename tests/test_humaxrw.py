@@ -6,9 +6,12 @@ from struct import pack
 
 from humaxrw import (
     HRE_SIZE_9200,
+    TS_PACKET,
     decode_humax_name,
     fat_next_cluster,
     human_size,
+    packet_aligned_size,
+    parse_byte_size,
     parse_hre_entries,
     parse_id_list,
     parse_size_limit,
@@ -72,6 +75,12 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(parse_size_limit(None), 20 * 1024**3)
         self.assertIsNone(parse_size_limit("0"))
         self.assertEqual(parse_size_limit("50G"), 50 * 1024**3)
+
+    def test_parse_chunk_size(self):
+        self.assertIsNone(parse_byte_size(None, default=None))
+        self.assertEqual(parse_byte_size("4G", default=None), 4 * 1024**3)
+        self.assertEqual(packet_aligned_size(4 * 1024**3) % TS_PACKET, 0)
+        self.assertEqual(packet_aligned_size(TS_PACKET * 3 + 10), TS_PACKET * 3)
 
     def test_parse_hre_entries(self):
         ent = bytearray(HRE_SIZE_9200)

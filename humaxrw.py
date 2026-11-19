@@ -21,7 +21,7 @@ from pathlib import Path
 from struct import unpack_from
 from typing import BinaryIO, Iterable, Iterator, Optional
 
-VERSION = "2026.2"
+VERSION = "2026.3"
 SECTOR = 512
 DIR_ENTRY_SIZE = 128
 TS_PACKET = 188
@@ -111,16 +111,16 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
     return (cleaned or "recording")[:max_len]
 
 
-def parse_size_limit(spec: Optional[str]) -> Optional[int]:
-    """Return max bytes, or None for unlimited. Empty/0 means unlimited."""
+def parse_byte_size(spec: Optional[str], *, default: Optional[int] = None) -> Optional[int]:
+    """Parse a size like 4G / 512MiB. None uses default; 0/unlimited → None."""
     if spec is None:
-        return DEFAULT_MAX_BYTES
+        return default
     text = spec.strip().lower()
     if text in ("", "0", "none", "unlimited", "off"):
         return None
     m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgtpe]i?b?)?", text)
     if not m:
-        raise ValueError(f"invalid size limit: {spec!r}")
+        raise ValueError(f"invalid size: {spec!r}")
     value = float(m.group(1))
     unit = (m.group(2) or "b").lower()
     mult = {
@@ -145,6 +145,16 @@ def parse_size_limit(spec: Optional[str]) -> Optional[int]:
     if mult is None:
         raise ValueError(f"invalid size unit in {spec!r}")
     return int(value * mult)
+
+
+def parse_size_limit(spec: Optional[str]) -> Optional[int]:
+    """Return max extract bytes, or None for unlimited. Default is DEFAULT_MAX_BYTES."""
+    return parse_byte_size(spec, default=DEFAULT_MAX_BYTES)
+
+
+def packet_aligned_size(nbytes: int) -> int:
+    """Largest multiple of TS_PACKET that does not exceed nbytes."""
+    return (nbytes // TS_PACKET) * TS_PACKET
 
 
 def fat_next_cluster(fat: bytes, cluster: int) -> Optional[int]:
@@ -650,43 +660,128 @@ def extract_recording(
     *,
     sidecars: bool = True,
     progress: bool = True,
-) -> Path:
+    chunk_bytes: Optional[int] = None,
+) -> list[Path]:
+    """Extract MPEG-TS (optionally split into packet-aligned parts).
+
+    When chunk_bytes is set, writes ``label.part001.ts``, ``label.part002.ts``, …
+    If the whole recording fits in one chunk, renames to ``label.ts``.
+    Sidecars always use the base label.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     label = recording_label(rec)
-    ts_path = out_dir / f"{label}.ts"
+    chunk_limit: Optional[int] = None
+    if chunk_bytes is not None:
+        chunk_limit = packet_aligned_size(chunk_bytes)
+        if chunk_limit < TS_PACKET:
+            raise ValueError(
+                f"chunk size {human_size(chunk_bytes)} is smaller than one TS packet"
+            )
+
     first = True
     written = 0
     align_skip = 0
     leftover = b""
-    with ts_path.open("wb") as out:
+    part_idx = 1
+    part_written = 0
+    paths: list[Path] = []
+    out: Optional[BinaryIO] = None
+    current_name = label
+
+    def open_part() -> None:
+        nonlocal out, part_written, current_name
+        if chunk_limit is None:
+            path = out_dir / f"{label}.ts"
+            current_name = path.name
+        else:
+            path = out_dir / f"{label}.part{part_idx:03d}.ts"
+            current_name = path.name
+        paths.append(path)
+        out = path.open("wb")
+        part_written = 0
+
+    def close_part() -> None:
+        nonlocal out
+        if out is not None:
+            out.close()
+            out = None
+
+    def rotate_part() -> None:
+        nonlocal part_idx
+        close_part()
+        part_idx += 1
+        open_part()
+
+    def emit(payload: bytes) -> None:
+        nonlocal written, part_written, leftover
+        assert out is not None
+        data = leftover + payload
+        leftover = b""
+        while data:
+            n = (len(data) // TS_PACKET) * TS_PACKET
+            if n == 0:
+                leftover = data
+                return
+            if chunk_limit is None:
+                take = n
+            else:
+                room = chunk_limit - part_written
+                if room < TS_PACKET:
+                    rotate_part()
+                    continue
+                take = min(n, packet_aligned_size(room))
+                if take == 0:
+                    rotate_part()
+                    continue
+            assert out is not None
+            out.write(data[:take])
+            data = data[take:]
+            written += take
+            part_written += take
+            if progress:
+                pct = min(100.0, 100.0 * written / max(rec.size, 1))
+                msg = (
+                    f"\r  {current_name}: {human_size(written)} / "
+                    f"{human_size(rec.size)} ({pct:5.1f}%)"
+                )
+                print(f"{msg}\x1b[K", end="", file=sys.stderr, flush=True)
+            if chunk_limit is not None and part_written >= chunk_limit and data:
+                rotate_part()
+
+    open_part()
+    try:
         for chunk in disk.iter_file_bytes(rec.av):
             if first:
                 align_skip, chunk = ts_align(chunk)
                 first = False
-            data = leftover + chunk
-            n = (len(data) // TS_PACKET) * TS_PACKET
-            out.write(data[:n])
-            leftover = data[n:]
-            written += n
-            if progress:
-                pct = min(100.0, 100.0 * written / max(rec.size, 1))
-                msg = (
-                    f"\r  {ts_path.name}: {human_size(written)} / "
-                    f"{human_size(rec.size)} ({pct:5.1f}%)"
-                )
-                # Clear to end of line so shorter updates do not leave junk.
-                print(f"{msg}\x1b[K", end="", file=sys.stderr, flush=True)
+            emit(chunk)
         if leftover:
+            assert out is not None
+            # Trailing partial packet: keep on the current part rather than
+            # opening a near-empty final fragment.
             out.write(leftover)
             written += len(leftover)
+            part_written += len(leftover)
+            leftover = b""
+    finally:
+        close_part()
+
     if progress:
         print(file=sys.stderr)
+
+    # Single-part chunked extract → drop the .part001 suffix.
+    if chunk_limit is not None and len(paths) == 1:
+        final = out_dir / f"{label}.ts"
+        if paths[0] != final:
+            paths[0].replace(final)
+            paths[0] = final
+
     if sidecars:
         if rec.elu is not None:
             elu_path = out_dir / f"{label}.elu"
-            with elu_path.open("wb") as out:
+            with elu_path.open("wb") as side:
                 for chunk in disk.iter_file_bytes(rec.elu):
-                    out.write(chunk)
+                    side.write(chunk)
         if rec.epg is not None:
             (out_dir / f"{label}.epg").write_bytes(disk.read_meta_file(rec.epg))
         if rec.hre is not None and rec.hre.raw:
@@ -700,6 +795,8 @@ def extract_recording(
             "start": rec.start_dt.isoformat() if rec.start_dt else None,
             "bytes": rec.size,
             "written": written,
+            "parts": [p.name for p in paths],
+            "chunk_bytes": chunk_limit,
             "ts_sync_skip": align_skip,
             "source": str(disk.path),
         }
@@ -715,7 +812,7 @@ def extract_recording(
             lines.append("")
             lines.append(rec.synopsis or "")
             (out_dir / f"{label}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return ts_path
+    return paths
 
 
 def cmd_list(disk: HumaxDisk, as_json: bool = False) -> None:
@@ -791,6 +888,7 @@ def cmd_get(
     out_dir: Path,
     sidecars: bool,
     max_bytes: Optional[int],
+    chunk_bytes: Optional[int] = None,
 ) -> None:
     recs = disk.find_recordings(spec)
     if not recs:
@@ -804,8 +902,15 @@ def cmd_get(
             )
             continue
         print(f"Extracting {rec.number} — {rec.title or rec.av.name}", file=sys.stderr)
-        path = extract_recording(disk, rec, out_dir, sidecars=sidecars)
-        print(path)
+        paths = extract_recording(
+            disk,
+            rec,
+            out_dir,
+            sidecars=sidecars,
+            chunk_bytes=chunk_bytes,
+        )
+        for path in paths:
+            print(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -819,6 +924,7 @@ def build_parser() -> argparse.ArgumentParser:
   python3 humaxrw.py list dump.img
   python3 humaxrw.py get dump.img 1-5,49 -o ./out
   python3 humaxrw.py -b -o ./out --max-size 50G dump.img
+  python3 humaxrw.py -g 42 -o ./out --chunk-size 4G --max-size 0 dump.img
 """,
     )
     p.add_argument("-V", "--version", action="version", version=f"HumaxRW {VERSION}")
@@ -836,6 +942,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "skip recordings larger than SIZE when extracting "
             f"(default {human_size(DEFAULT_MAX_BYTES)}; 0/unlimited disables)"
+        ),
+    )
+    p.add_argument(
+        "--chunk-size",
+        default=None,
+        metavar="SIZE",
+        help=(
+            "split each .ts into packet-aligned parts of at most SIZE "
+            "(e.g. 4G → Title.part001.ts, Title.part002.ts, …)"
         ),
     )
     p.add_argument(
@@ -881,6 +996,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     try:
         max_bytes = parse_size_limit(args.max_size)
+        chunk_bytes = parse_byte_size(args.chunk_size, default=None)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -892,9 +1008,23 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         elif cmd == "get":
             if not ids:
                 raise SystemExit("get requires a recording list, e.g. -g 49 or get IMAGE 49")
-            cmd_get(disk, ids, Path(args.output), sidecars=not args.no_sidecars, max_bytes=max_bytes)
+            cmd_get(
+                disk,
+                ids,
+                Path(args.output),
+                sidecars=not args.no_sidecars,
+                max_bytes=max_bytes,
+                chunk_bytes=chunk_bytes,
+            )
         elif cmd == "backup":
-            cmd_get(disk, "all", Path(args.output), sidecars=not args.no_sidecars, max_bytes=max_bytes)
+            cmd_get(
+                disk,
+                "all",
+                Path(args.output),
+                sidecars=not args.no_sidecars,
+                max_bytes=max_bytes,
+                chunk_bytes=chunk_bytes,
+            )
         else:
             parser.print_help()
             return 2

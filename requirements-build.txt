@@ -1,0 +1,2 @@
+# Build-time only (runtime GUI still needs nothing beyond stdlib + tkinter).
+pyinstaller>=6.3

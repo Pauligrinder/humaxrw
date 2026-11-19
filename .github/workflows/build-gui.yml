@@ -1,0 +1,280 @@
+name: Build GUI
+
+# Builds HumaxRW GUI for every GitHub-hosted OS/arch we can, then publishes a
+# GitHub Release (tag push or manual "Release" dispatch).
+#
+# Artifacts:
+#   HumaxRW-<version>-macOS-arm64.zip
+#   HumaxRW-<version>-macOS-x86_64.zip
+#   HumaxRW-<version>-Windows-amd64.zip
+#   HumaxRW-<version>-Windows-arm64.zip
+#   HumaxRW-<version>-Linux-amd64.zip
+#   HumaxRW-<version>-Linux-arm64.zip
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading v (e.g. 2026.4). Empty = read from humaxrw.py"
+        required: false
+        default: ""
+      create_release:
+        description: "Create a GitHub Release and tag after building"
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.out.outputs.version }}
+      tag: ${{ steps.out.outputs.tag }}
+      make_release: ${{ steps.out.outputs.make_release }}
+      prerelease: ${{ steps.out.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version / tag
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            MAKE_RELEASE=true
+            PRERELEASE=false
+          else
+            VERSION="${{ inputs.version }}"
+            if [[ -z "${VERSION}" ]]; then
+              VERSION="$(python3 -c "import re,pathlib; t=pathlib.Path('humaxrw.py').read_text(); print(re.search(r'VERSION\s*=\s*\"([^\"]+)\"', t).group(1))")"
+            fi
+            TAG="v${VERSION}"
+            MAKE_RELEASE="${{ inputs.create_release }}"
+            PRERELEASE="${{ inputs.prerelease }}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "make_release=${MAKE_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved VERSION=${VERSION} TAG=${TAG} make_release=${MAKE_RELEASE}"
+
+  build:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact_os: macOS
+            artifact_arch: arm64
+          - os: macos-15-intel
+            artifact_os: macOS
+            artifact_arch: x86_64
+          - os: windows-latest
+            artifact_os: Windows
+            artifact_arch: amd64
+          - os: windows-11-arm
+            artifact_os: Windows
+            artifact_arch: arm64
+          - os: ubuntu-24.04
+            artifact_os: Linux
+            artifact_arch: amd64
+          - os: ubuntu-24.04-arm
+            artifact_os: Linux
+            artifact_arch: arm64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      HUMAXRW_VERSION: ${{ needs.resolve-version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tcl-dev tk-dev
+
+      - name: Install build deps
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Stamp VERSION into source for this release
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          path = pathlib.Path("humaxrw.py")
+          text = path.read_text(encoding="utf-8")
+          version = os.environ["HUMAXRW_VERSION"]
+          new, n = re.subn(
+              r'^VERSION\s*=\s*"[^"]*"',
+              f'VERSION = "{version}"',
+              text,
+              count=1,
+              flags=re.M,
+          )
+          if n != 1:
+              raise SystemExit("Could not stamp VERSION in humaxrw.py")
+          path.write_text(new, encoding="utf-8")
+          print(f"Stamped VERSION = {version!r}")
+          PY
+
+      - name: Show build host
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform, sys
+          print("python:", sys.version)
+          print("system:", platform.system())
+          print("machine:", platform.machine())
+          print("platform:", platform.platform())
+          PY
+
+      - name: Build
+        run: python build_gui.py --skip-install
+
+      - name: Stage package
+        shell: bash
+        env:
+          ARTIFACT_OS: ${{ matrix.artifact_os }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+        run: |
+          set -euo pipefail
+          NAME="HumaxRW-${HUMAXRW_VERSION}-${ARTIFACT_OS}-${ARTIFACT_ARCH}"
+          mkdir -p staging
+          case "${{ runner.os }}" in
+            macOS)
+              ditto dist/HumaxRW.app "staging/HumaxRW.app"
+              (cd staging && zip -ry "../${NAME}.zip" HumaxRW.app)
+              ;;
+            Windows)
+              # Git Bash on windows-latest / windows-11-arm
+              cp dist/HumaxRW.exe staging/
+              (cd staging && zip -r "../${NAME}.zip" HumaxRW.exe)
+              ;;
+            Linux)
+              cp dist/HumaxRW staging/
+              cp humaxrw_gui.sh staging/
+              chmod +x staging/HumaxRW staging/humaxrw_gui.sh
+              (cd staging && zip -r "../${NAME}.zip" HumaxRW humaxrw_gui.sh)
+              ;;
+            *)
+              echo "Unknown runner OS: ${{ runner.os }}" >&2
+              exit 1
+              ;;
+          esac
+          ls -lh "${NAME}.zip"
+          echo "PACKAGE_NAME=${NAME}.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HumaxRW-${{ needs.resolve-version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}
+          path: HumaxRW-${{ needs.resolve-version.outputs.version }}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: [resolve-version, build]
+    if: needs.resolve-version.outputs.make_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: HumaxRW-${{ needs.resolve-version.outputs.version }}-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List assets
+        run: find release-assets -type f -print | sort
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          PRERELEASE: ${{ needs.resolve-version.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ASSETS=(release-assets/*.zip)
+          if (( ${#ASSETS[@]} == 0 )); then
+            echo "No zip assets found" >&2
+            exit 1
+          fi
+
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## HumaxRW ${VERSION}"
+            echo
+            echo "Packaged GUI builds (PyInstaller). Pick the zip that matches your OS and CPU:"
+            echo
+            echo "| File | Platform |"
+            echo "|------|----------|"
+            echo "| HumaxRW-${VERSION}-macOS-arm64.zip | Apple Silicon Mac |"
+            echo "| HumaxRW-${VERSION}-macOS-x86_64.zip | Intel Mac |"
+            echo "| HumaxRW-${VERSION}-Windows-amd64.zip | Windows x64 |"
+            echo "| HumaxRW-${VERSION}-Windows-arm64.zip | Windows on Arm |"
+            echo "| HumaxRW-${VERSION}-Linux-amd64.zip | Linux x86_64 |"
+            echo "| HumaxRW-${VERSION}-Linux-arm64.zip | Linux aarch64 |"
+            echo
+            echo "macOS apps are unsigned — right-click → **Open** the first time if Gatekeeper blocks them."
+            echo "Opening a raw Humax disk still needs elevated rights (sudo / Run as administrator)."
+            echo
+            echo "Source / CLI: run python3 humaxrw.py or python3 humaxrw_gui.py from the repo (Python + tkinter)."
+          } > "${NOTES_FILE}"
+
+          PRE_ARGS=()
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            PRE_ARGS+=(--prerelease)
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists — uploading/replacing assets"
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+            gh release edit "${TAG}" --title "HumaxRW ${VERSION}" --notes-file "${NOTES_FILE}" "${PRE_ARGS[@]}"
+          else
+            # Tag may already exist (tag-push trigger) or not (manual dispatch).
+            if git rev-parse "${TAG}" >/dev/null 2>&1; then
+              gh release create "${TAG}" "${ASSETS[@]}" \
+                --title "HumaxRW ${VERSION}" \
+                --notes-file "${NOTES_FILE}" \
+                "${PRE_ARGS[@]}"
+            else
+              gh release create "${TAG}" "${ASSETS[@]}" \
+                --target "${{ github.sha }}" \
+                --title "HumaxRW ${VERSION}" \
+                --notes-file "${NOTES_FILE}" \
+                "${PRE_ARGS[@]}"
+            fi
+          fi
+
+          echo "Published ${TAG}"
+          gh release view "${TAG}" --json url,tagName,assets --jq '{url,tagName,assets:[.assets[].name]}'

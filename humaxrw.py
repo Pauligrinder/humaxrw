@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from struct import unpack_from
-from typing import BinaryIO, Iterable, Iterator, Optional
+from typing import BinaryIO, Callable, Iterable, Iterator, Optional
 
-VERSION = "2026.3"
+VERSION = "2026.4"
 SECTOR = 512
 DIR_ENTRY_SIZE = 128
 TS_PACKET = 188
@@ -661,12 +661,16 @@ def extract_recording(
     sidecars: bool = True,
     progress: bool = True,
     chunk_bytes: Optional[int] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> list[Path]:
     """Extract MPEG-TS (optionally split into packet-aligned parts).
 
     When chunk_bytes is set, writes ``label.part001.ts``, ``label.part002.ts``, …
     If the whole recording fits in one chunk, renames to ``label.ts``.
     Sidecars always use the base label.
+
+    on_progress, if set, is called as ``on_progress(written, total, current_name)``.
+    When omitted and progress is True, a stderr progress line is printed instead.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     label = recording_label(rec)
@@ -687,6 +691,18 @@ def extract_recording(
     paths: list[Path] = []
     out: Optional[BinaryIO] = None
     current_name = label
+    total = max(rec.size, 1)
+
+    def report_progress() -> None:
+        if on_progress is not None:
+            on_progress(written, total, current_name)
+        elif progress:
+            pct = min(100.0, 100.0 * written / total)
+            msg = (
+                f"\r  {current_name}: {human_size(written)} / "
+                f"{human_size(rec.size)} ({pct:5.1f}%)"
+            )
+            print(f"{msg}\x1b[K", end="", file=sys.stderr, flush=True)
 
     def open_part() -> None:
         nonlocal out, part_written, current_name
@@ -738,13 +754,7 @@ def extract_recording(
             data = data[take:]
             written += take
             part_written += take
-            if progress:
-                pct = min(100.0, 100.0 * written / max(rec.size, 1))
-                msg = (
-                    f"\r  {current_name}: {human_size(written)} / "
-                    f"{human_size(rec.size)} ({pct:5.1f}%)"
-                )
-                print(f"{msg}\x1b[K", end="", file=sys.stderr, flush=True)
+            report_progress()
             if chunk_limit is not None and part_written >= chunk_limit and data:
                 rotate_part()
 
@@ -763,10 +773,11 @@ def extract_recording(
             written += len(leftover)
             part_written += len(leftover)
             leftover = b""
+            report_progress()
     finally:
         close_part()
 
-    if progress:
+    if progress and on_progress is None:
         print(file=sys.stderr)
 
     # Single-part chunked extract → drop the .part001 suffix.

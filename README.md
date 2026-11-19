@@ -24,6 +24,43 @@ python3 humaxrw.py -g 42 -o ./out --chunk-size 4G --max-size 0 /path/to/humax-92
 
 Recording numbers are the Humax file numbers (`36.av` → `36`). Subcommands also work: `list`, `info`, `get`, `backup`.
 
+### GUI
+
+A simple tkinter front-end lists recordings and extracts the selection to a folder you choose:
+
+```bash
+python3 humaxrw_gui.py
+# or on Linux/macOS:
+./humaxrw_gui.sh
+```
+
+Use **Open disk image…** for `.img` / `.dd` files, or **Open drive…** for a whole-disk raw device (`/dev/rdiskN`, `/dev/sdX`, `\\.\PhysicalDriveN`). Opening a raw drive usually needs elevated rights — on macOS/Linux run with `sudo`, on Windows run as Administrator. If open fails with a permission error, the GUI says so explicitly.
+
+#### Packaged builds
+
+PyInstaller packages (no Python install needed to run):
+
+| Platform | Local artifact | CI zip |
+|----------|----------------|--------|
+| macOS Apple Silicon | `dist/HumaxRW.app` | `HumaxRW-*-macOS-arm64.zip` |
+| macOS Intel | `dist/HumaxRW.app` | `HumaxRW-*-macOS-x86_64.zip` |
+| Windows x64 | `dist/HumaxRW.exe` | `HumaxRW-*-Windows-amd64.zip` |
+| Windows Arm | `dist/HumaxRW.exe` | `HumaxRW-*-Windows-arm64.zip` |
+| Linux x86_64 | `dist/HumaxRW` | `HumaxRW-*-Linux-amd64.zip` |
+| Linux aarch64 | `dist/HumaxRW` | `HumaxRW-*-Linux-arm64.zip` |
+
+```bash
+python3 -m pip install -r requirements-build.txt
+python3 build_gui.py
+```
+
+PyInstaller cannot cross-compile — build on the target OS, or use GitHub Actions:
+
+- **Actions → Build GUI → Run workflow** — builds all six OS/arch zips and (by default) creates a GitHub Release / tag
+- Pushing a `v*` tag does the same
+
+The macOS `.app` is unsigned; Gatekeeper may require right-click → Open the first time. Opening raw disks still needs elevated rights even for a frozen binary (`sudo` / Run as administrator).
+
 Titles and air times come from `_RECORD_LIST_` on the metadata partition (same data as classic `.hre` sidecars), so series sort in chronological order. EPG text is still used for synopses and as a fallback name. Extracts larger than **20 GiB** are skipped by default (`--max-size 0` disables the limit) so orphaned giant `.av` files do not block a backup. Use `--chunk-size` to split a recording into packet-aligned `.partNNN.ts` pieces (handy for huge files you still want to keep).
 
 Each extract writes:
